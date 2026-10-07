@@ -627,8 +627,7 @@ Planned milestones (not built):
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests (local, no extras) | **70 passed, 5 skipped** | `pytest -q` |
-| Unit tests (clean venv, `pip install -e ".[dev]"`, as in CI) | **70 passed, 5 skipped** | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **70 passed, 5 skipped** (the `boost`, `explain`, `tune` and `forecast` extras) | `pytest -q` |
 | SYNTHETIC demo, `random`, OOF RMSE | `mean` 2,225 · `mrp_baseline` 1,293 · `ridge` 1,357 · `random_forest` 1,210 · `hist_gbm` **1,099** | `salescope demo` |
 | SYNTHETIC demo, `new_outlet`, OOF RMSE | `mean` 2,355 · `mrp_baseline` **1,318** · `ridge` 1,888 · `random_forest` 1,586 · `hist_gbm` **1,318** | `salescope demo` |
 | SYNTHETIC demo, `new_item`, OOF RMSE | `mean` 2,223 · `mrp_baseline` 1,292 · `ridge` 1,359 · `random_forest` 1,238 · `hist_gbm` **1,183** | `salescope demo` |
