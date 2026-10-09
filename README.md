@@ -69,6 +69,7 @@ This README is the **one location that explains all of salescope**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one model run](#42-the-life-cycle-of-one-model-run)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The schema and the loader](#5-the-schema-and-the-loader)
 6. 🟢 [Feature engineering](#6-feature-engineering)
 7. 🟣 [The model registry](#7-the-model-registry)
@@ -142,6 +143,32 @@ flowchart LR
 | Saved models | `src/salescope/persistence.py` | `joblib` model plus a metadata JSON with a data fingerprint |
 | CLI | `src/salescope/cli.py` | The `salescope` command with 10 subcommands |
 
+The component map shows which module calls which module.
+
+```mermaid
+flowchart LR
+    CLI["cli.py<br/>10 subcommands"] --> CFG["config.py<br/>Settings, load_dotenv"]
+    CLI --> DATA["data.py<br/>load_frame, split_xy"]
+    CLI --> SYN["synthetic.py<br/>make_dataset"]
+    DATA --> SCH["schema.py<br/>validate"]
+    CLI --> EVA["evaluate.py<br/>compare, cross_validate"]
+    CLI --> STK["stacking.py<br/>stack_evaluate"]
+    CLI --> TUN["tuning.py<br/>tune"]
+    CLI --> EXP["explain.py<br/>explain"]
+    CLI --> FC["forecast.py<br/>rolling_origin_backtest"]
+    CLI --> PER["persistence.py<br/>save_model, load_model"]
+    EVA --> SPL["splits.py<br/>iter_folds, holdout_split"]
+    EVA --> MOD["models.py<br/>build_model"]
+    EVA --> MET["metrics.py<br/>regression_report, bootstrap_ci"]
+    STK --> SPL
+    STK --> MOD
+    TUN --> EVA
+    TUN --> SPL
+    EXP --> SPL
+    EXP --> MOD
+    MOD --> FEA["features.py<br/>BigMartFeatures"]
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -187,6 +214,22 @@ BigMart has no dates. salescope never makes dates from the row order. `forecast.
 ### 3.2 Fold-local preprocessing
 `BigMartFeatures` learns the item weights, the item visibility means and the outlet sizes in `fit`. The transformer is the first step of each pipeline. Thus each fold fits these statistics on its training rows only.
 
+```mermaid
+flowchart LR
+    F[/"One fold"/] --> TR["Training rows"]
+    F --> TE["Test rows"]
+    TR --> FIT["BigMartFeatures.fit<br/>item weights, item visibility,<br/>outlet size by type"]
+    FIT --> STATS[("Fitted statistics<br/>of this fold only")]
+    STATS --> TX1["transform the training rows"]
+    STATS --> TX2["transform the test rows"]
+    TR --> TX1
+    TE --> TX2
+    TX1 --> ENC["Encoder and regressor<br/>fit"]
+    TX2 --> PRED["predict"]
+    ENC --> PRED
+    PRED --> OOF[/"OOF predictions<br/>of the test rows"/]
+```
+
 ### 3.3 The target never reaches the features
 `BigMartFeatures` raises `LeakageError` if the frame contains `Item_Outlet_Sales`. `data.split_xy` removes the target before each fit.
 
@@ -223,23 +266,61 @@ BigMart has no dates. salescope never makes dates from the row order. `forecast.
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    CSV["Train CSV"] --> NORM["Normalise labels"] --> VAL{"Schema valid?"}
-    VAL -- "no" --> ERR["error: list of problems"]
-    VAL -- "yes" --> XY["split_xy: features and target"]
-    XY --> CV["iter_folds: random, new_outlet, new_item"]
-    CV --> FIT["Fit pipeline on training rows"]
-    FIT --> OOF["OOF predictions and fold metrics"]
-    OOF --> TAB["CV table with bootstrap interval"]
-    XY --> HOLD["holdout_split (grouped)"]
-    HOLD --> STK["OOF stack on development rows"] --> HS["One score on holdout"]
-    HOLD --> TUNE["Search inside grouped CV"] --> HS
-    HOLD --> EXP["Permutation importance, errors by group"]
-    XY --> TRAIN["train: fit on all rows"] --> SAVE["artifacts/model.joblib + metadata.json"]
-    SAVE --> PRED["predict: test CSV to predictions CSV"]
+flowchart TD
+    CSV[/"Train CSV<br/>BigMart or salescope synth"/] --> NORM["normalise_labels<br/>strip text, fat-content aliases"]
+    NORM --> VAL{"schema.validate:<br/>all rules pass?"}
+    VAL -- "no" --> ERR[/"error: list of problems,<br/>exit code 1"/]
+    VAL -- "yes" --> XY["split_xy<br/>features and target"]
+    XY --> CV["iter_folds<br/>random, new_outlet, new_item"]
+    CV --> FIT["Fit a fresh pipeline<br/>on the training rows of the fold"]
+    FIT --> OOF["OOF predictions,<br/>test and train fold metrics"]
+    OOF --> TAB[/"CV table with a bootstrap<br/>interval of the OOF RMSE"/]
+    XY --> HOLD["holdout_split<br/>grouped by the scheme"]
+    HOLD --> STK["OOF stack on the<br/>development rows"]
+    HOLD --> TUNE["Search inside grouped CV<br/>on the development rows"]
+    HOLD --> EXP["Permutation importance,<br/>errors by group"]
+    STK --> HS[/"One score on the holdout"/]
+    TUNE --> HS
+    EXP --> HS
+    TAB --> HUM{{"HUMAN<br/>Analyst reads the tables<br/>and selects the model"}}
+    HS --> HUM
+    HUM --> TRAIN["salescope train<br/>fit on all rows"]
+    TRAIN --> SAVE[("artifacts/model/<br/>model.joblib, metadata.json")]
+    SAVE --> PRED["salescope predict"]
+    TEST[/"Test CSV, no target"/] --> PRED
+    PRED --> OUT[/"predictions.csv"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUM human
 ```
 
 ### 4.2 The life cycle of one model run
+
+The diagram shows the states of one `cross_validate` run for one model and one CV scheme.
+
+```mermaid
+stateDiagram-v2
+    state "CSV file" as Raw
+    state "Normalised frame" as Normalised
+    state "Typed frame" as Typed
+    state "X and y" as XY
+    state "Fold fitted" as Fitted
+    state "Fold scored" as Scored
+    state "CVResult" as Result
+    [*] --> Raw
+    Raw --> FileError: file does not exist
+    Raw --> Normalised: normalise_labels
+    Normalised --> SchemaError: one or more rules fail
+    Normalised --> Typed: validate
+    Typed --> XY: split_xy removes the target
+    XY --> Fitted: iter_folds, clone the pipeline, fit
+    Fitted --> Scored: predict test rows, clip at 0
+    Scored --> Fitted: next fold
+    Scored --> Result: last fold, OOF metrics, bootstrap interval
+    Result --> [*]
+    FileError --> [*]
+    SchemaError --> [*]
+```
 
 1. The loader reads the CSV and normalises the fat-content labels.
 2. The validator checks each column. A problem stops the run with `error:`.
@@ -250,6 +331,46 @@ flowchart TB
 7. The evaluator records the test metrics and the train metrics of the fold.
 8. After the last fold, the evaluator calculates the OOF metrics and a bootstrap interval for RMSE.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as salescope CLI
+    participant CFG as config.py
+    participant DATA as data.py and schema.py
+    participant EVA as evaluate.py
+    participant SPL as splits.py
+    participant MOD as models.py
+    participant MET as metrics.py
+    participant PER as persistence.py
+
+    A->>CLI: salescope evaluate
+    CLI->>CFG: load_dotenv, Settings.from_env
+    CLI->>DATA: load_frame(train CSV)
+    DATA-->>CLI: typed frame, or SchemaError
+    CLI->>EVA: compare(models, schemes, folds, seed)
+    loop each scheme and each model
+        EVA->>MOD: build_model(name, seed)
+        loop each fold
+            EVA->>SPL: iter_folds gives train and test positions
+            EVA->>MOD: clone, fit on training rows, predict
+            EVA->>MET: regression_report for test and train rows
+        end
+        EVA->>MET: OOF metrics, bootstrap_ci
+    end
+    EVA-->>CLI: summary table
+    CLI-->>A: CV table, all test metrics out-of-fold
+    A->>CLI: salescope train with the selected model
+    CLI->>MOD: build_model, fit on all rows
+    CLI->>PER: save_model with metadata and frame_fingerprint
+    A->>CLI: salescope predict with the model folder and the test CSV
+    CLI->>PER: load_model, warn on a scikit-learn version change
+    CLI->>DATA: load_frame(test CSV, no target)
+    CLI-->>A: predictions.csv
+```
+
 ---
 
 ## 5. The schema and the loader
@@ -259,6 +380,23 @@ flowchart TB
 | Input | Output |
 |---|---|
 | A CSV path and the flag `require_target` | A typed frame, or `SchemaError` with each problem |
+
+```mermaid
+flowchart TD
+    P[/"CSV path, require_target"/] --> EX{"File exists?"}
+    EX -- "no" --> FNF[/"FileNotFoundError<br/>see data/README.md"/]
+    EX -- "yes" --> RD["pd.read_csv"]
+    RD --> NL["normalise_labels<br/>strip text, LF and low fat to Low Fat,<br/>reg to Regular"]
+    NL --> COL{"All contract<br/>columns present?"}
+    COL -- "no" --> SE1[/"SchemaError: missing columns"/]
+    COL -- "yes" --> ROWS{"Any row?"}
+    ROWS -- "no" --> SE1
+    ROWS -- "yes" --> CHK["_check_column for each column<br/>missing, numeric, range,<br/>pattern, allowed values"]
+    CHK --> DUP["Duplicate item-outlet pairs"]
+    DUP --> ANY{"Any problem?"}
+    ANY -- "yes" --> SE2[/"SchemaError with all problems"/]
+    ANY -- "no" --> OUT[/"Typed frame"/]
+```
 
 **Procedure**
 
@@ -284,6 +422,19 @@ flowchart TB
 | Input | Output |
 |---|---|
 | A feature frame without the target | 8 numeric and 6 categorical features |
+
+```mermaid
+flowchart LR
+    X[/"Feature frame"/] --> G{"Item_Outlet_Sales<br/>in the frame?"}
+    G -- "yes" --> LE[/"LeakageError"/]
+    G -- "no" --> FIT["fit on the training rows<br/>item median weight, item mean visibility,<br/>outlet size mode by type"]
+    FIT --> T1["Impute weight<br/>item, then global median"]
+    T1 --> T2["Replace zero visibility<br/>item, then global mean"]
+    T2 --> T3["Visibility_Ratio,<br/>Outlet_Age"]
+    T3 --> T4["Impute Outlet_Size<br/>mode of the outlet type"]
+    T4 --> T5["Item_Category from the prefix,<br/>Non-Edible fat content"]
+    T5 --> OUT[/"8 numeric and<br/>6 categorical features"/]
+```
 
 **Procedure (`fit`)**
 
@@ -316,6 +467,25 @@ flowchart TB
 
 **Purpose.** Give each model as one full pipeline, so the CV code treats all models the same way.
 
+```mermaid
+flowchart LR
+    N[/"Model name, seed,<br/>log_target, params"/] --> K{"Name in REGISTRY?"}
+    K -- "no" --> KE[/"KeyError"/]
+    K -- "yes" --> FE["features<br/>BigMartFeatures"]
+    FE --> ENC{"Encoder of the model"}
+    ENC -- "ridge" --> OH["One-hot + StandardScaler"]
+    ENC -- "random_forest, hist_gbm,<br/>lightgbm" --> ORD["Ordinal encoder"]
+    ENC -- "mean, mrp_baseline,<br/>catboost" --> NONE["No encoder"]
+    OH --> REG["Regressor"]
+    ORD --> REG
+    NONE --> REG
+    REG --> LT{"log_target?"}
+    LT -- "yes" --> TTR["TransformedTargetRegressor<br/>log1p and expm1"]
+    LT -- "no" --> NN
+    TTR --> NN["NonNegative<br/>clip at 0"]
+    NN --> OUT[/"Unfitted estimator"/]
+```
+
 | Name | Encoder | Regressor | Extra |
 |---|---|---|---|
 | `mean` | none | `DummyRegressor(mean)` | core |
@@ -338,6 +508,22 @@ flowchart TB
 ## 8. The CV schemes
 
 **Purpose.** Measure the model for the question that the business asks.
+
+```mermaid
+flowchart TD
+    IN[/"X, scheme, n_splits, seed"/] --> K["effective_splits<br/>min of n_splits and the group count"]
+    K --> S{"Scheme"}
+    S -- "random" --> R["Permute the rows with the seed,<br/>deal them to the folds in turn"]
+    S -- "new_outlet or new_item" --> G["Sorted groups, shuffled with the seed,<br/>largest group first"]
+    G --> A["Each group to the fold<br/>with the fewest rows"]
+    R --> F["For each fold:<br/>training rows and test rows"]
+    A --> F
+    F --> C{"Grouped scheme?"}
+    C -- "yes" --> ISO{"assert_group_isolation:<br/>group in both parts?"}
+    ISO -- "yes" --> GE[/"GroupIsolationError"/]
+    ISO -- "no" --> Y[/"train and test positions"/]
+    C -- "no" --> Y
+```
 
 | Scheme | Group | Question |
 |---|---|---|
@@ -362,6 +548,22 @@ flowchart TB
 ## 9. Evaluation and metrics
 
 **Purpose.** Give comparable numbers with their spread.
+
+```mermaid
+flowchart LR
+    IN[/"Frame, model, scheme"/] --> XY["split_xy"]
+    XY --> T["build_model<br/>one template"]
+    T --> LOOP["For each fold:<br/>clone, fit on the training rows"]
+    LOOP --> PT["Predict the test rows<br/>into the OOF Series"]
+    LOOP --> PR["Predict the training rows"]
+    PT --> FT["fold_test metrics"]
+    PR --> FR["fold_train metrics<br/>label train"]
+    PT --> OOF["OOF metrics<br/>over all rows"]
+    OOF --> CI["bootstrap_ci of the OOF RMSE<br/>300 resamples, 95 %"]
+    FT --> ROW[/"summary_row: mean and std of the folds,<br/>OOF metrics, train_rmse_mean, interval"/]
+    FR --> ROW
+    CI --> ROW
+```
 
 | Metric | Formula | Note |
 |---|---|---|
@@ -392,6 +594,20 @@ flowchart TB
 |---|---|
 | A train frame, 2 or more base models, a CV scheme | Meta-model weights and holdout metrics for each base model and for the stack |
 
+```mermaid
+flowchart TD
+    IN[/"Train frame, 2 or more base models,<br/>CV scheme"/] --> HS["holdout_split<br/>development rows and holdout rows"]
+    HS --> OOF["oof_predictions<br/>one column for each base model,<br/>development rows only"]
+    OOF --> META["LinearRegression positive=True<br/>fit on the OOF columns"]
+    HS --> REFIT["Fit each base model<br/>on all development rows"]
+    REFIT --> HP["Predict the holdout rows"]
+    HP --> AL{"align_predictions:<br/>same rows?"}
+    AL -- "no" --> AE[/"AlignmentError"/]
+    AL -- "yes" --> APPLY["Apply the meta-model<br/>to the holdout columns"]
+    META --> APPLY
+    APPLY --> REP[/"Holdout RMSE, RMSLE, MAE, R²<br/>for each base model and the stack,<br/>weights and intercept"/]
+```
+
 **Procedure**
 
 1. Split the rows into development rows and holdout rows, with the groups of the scheme.
@@ -411,6 +627,23 @@ flowchart TB
 ## 11. Hyperparameter search
 
 **Purpose.** Select hyperparameters with grouped CV and report one honest holdout score.
+
+```mermaid
+flowchart TD
+    IN[/"Frame, model, scheme,<br/>n_iter, backend"/] --> SP{"Model in<br/>SEARCH_SPACES?"}
+    SP -- "no" --> KE[/"KeyError"/]
+    SP -- "yes" --> HS["holdout_split<br/>development rows and holdout rows"]
+    HS --> B{"Backend"}
+    B -- "random" --> PS["ParameterSampler<br/>n_iter sets, seeded"]
+    B -- "optuna" --> OP["TPESampler<br/>n_iter trials, seeded"]
+    PS --> OBJ["cross_validate on the development rows<br/>score = OOF RMSE"]
+    OP --> OBJ
+    OBJ --> BEST["Best set: lowest OOF RMSE"]
+    BEST --> FT["Fit the tuned set<br/>on the development rows"]
+    HS --> FD["Fit the default set<br/>on the development rows"]
+    FT --> REP[/"Holdout metrics:<br/>tuned and default"/]
+    FD --> REP
+```
 
 **Procedure**
 
@@ -438,6 +671,20 @@ flowchart TB
 
 **Purpose.** Show which raw columns drive the predictions and where the model fails.
 
+```mermaid
+flowchart LR
+    IN[/"Frame, model, scheme"/] --> HS["holdout_split"]
+    HS --> FIT["Fit the model<br/>on the development rows"]
+    FIT --> PRED["Predict the holdout rows"]
+    PRED --> PI["Shuffle each of 9 raw columns<br/>5 times, RMSE increase"]
+    PRED --> EO["error_by_group<br/>by Outlet_Type"]
+    PRED --> EC["error_by_group<br/>by item category"]
+    PI --> OUT[/"Importance table and<br/>two error tables"/]
+    EO --> OUT
+    EC --> OUT
+    FIT -. "explain extra" .-> SH["shap_summary<br/>mean absolute SHAP"]
+```
+
 **Procedure**
 
 1. Fit the model on the development rows of a grouped holdout split.
@@ -459,6 +706,25 @@ flowchart TB
 | Input | Output |
 |---|---|
 | A long CSV: `series_id`, `date`, `sales` (gap-free months) | MAE, RMSE, sMAPE and MASE for each forecaster |
+
+```mermaid
+flowchart TD
+    IN[/"Long CSV or make_series"/] --> RD{"require_real_dates"}
+    RD -- "BigMart columns, no date" --> NT[/"NoTimeAxisError"/]
+    RD -- "bad date, duplicate,<br/>gap or short series" --> VE[/"Error"/]
+    RD -- "valid" --> ORG["n_origins origins,<br/>horizon months apart, at the end"]
+    ORG --> HIST["History: months before the origin"]
+    HIST --> SC["MASE scale: seasonal naive<br/>error of the history, season 12"]
+    HIST --> FIT["Fit each forecaster:<br/>naive, seasonal_naive, lag_gbm, sarima"]
+    FIT --> FC["Forecast horizon months"]
+    FC --> CHK{"Each future month<br/>forecast?"}
+    CHK -- "no" --> RE[/"RuntimeError"/]
+    CHK -- "yes" --> MET["MAE, RMSE, sMAPE, MASE"]
+    SC --> MET
+    MET --> NXT{"More origins?"}
+    NXT -- "yes" --> HIST
+    NXT -- "no" --> SUM[/"Mean metrics for each forecaster,<br/>sorted by MASE"/]
+```
 
 **Procedure**
 
@@ -485,6 +751,37 @@ flowchart TB
 ## 14. CLI and saved models
 
 **Purpose.** Give one command for each task.
+
+```mermaid
+flowchart TD
+    M["main: parse the arguments"] --> ENV["load_dotenv(--env-file)<br/>keep variables that are set"]
+    ENV --> SET["Settings.from_env"]
+    SET --> CMD{"Subcommand"}
+    CMD --> D1["synth, validate"]
+    CMD --> D2["evaluate, tune, stack, explain"]
+    CMD --> D3["train, predict"]
+    CMD --> D4["backtest, demo"]
+    D1 --> OK[/"Exit code 0"/]
+    D2 --> OK
+    D3 --> OK
+    D4 --> OK
+    SET -- "ConfigError" --> ERR[/"error: message,<br/>exit code 1"/]
+    CMD -- "SchemaError, NoTimeAxisError,<br/>FileNotFoundError, KeyError,<br/>ValueError, ImportError" --> ERR
+```
+
+```mermaid
+flowchart LR
+    TR["salescope train"] --> FIT["build_model, fit on all rows"]
+    FIT --> SAVE["save_model"]
+    SAVE --> J[("model.joblib")]
+    SAVE --> META[("metadata.json<br/>model, log_target, seed, reference_year,<br/>train_rows, train_sha256, sklearn_version")]
+    PR["salescope predict"] --> LOAD["load_model"]
+    J --> LOAD
+    META --> LOAD
+    LOAD -- "other scikit-learn version" --> W[/"Warning"/]
+    LOAD --> P["load_frame test CSV,<br/>predict, clip at 0"]
+    P --> OUT[/"predictions.csv<br/>item, outlet, sales"/]
+```
 
 | Command | What it does |
 |---|---|
@@ -568,6 +865,24 @@ pip install -e ".[boost,explain,tune,forecast]"   # optional extras
 ### 17.3 Run salescope
 
 Offline, with synthetic data:
+
+```mermaid
+flowchart LR
+    subgraph OFF["Offline, synthetic data"]
+        DEMO["salescope demo"]
+        SY["salescope synth"] --> EV1["evaluate"]
+        SY --> ST1["stack"]
+        BT["backtest"]
+    end
+    subgraph REAL["Real BigMart files in data/"]
+        V["validate train and test"] --> EV2["evaluate"]
+        EV2 --> TU["tune"]
+        EV2 --> EX["explain"]
+        TU --> TRN["train"]
+        EX --> TRN
+        TRN --> PRD["predict"]
+    end
+```
 
 ```bash
 salescope demo
